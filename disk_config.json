@@ -1,3 +1,9 @@
 {
-  "root": "D:/"
+  "root": "C:\\",
+  "users": [
+    {
+      "username": "admin",
+      "password": "123456"
+    }
+  ]
 }
