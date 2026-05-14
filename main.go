@@ -3,8 +3,10 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/webdav"
 )
@@ -31,8 +34,9 @@ type User struct {
 }
 
 type AppConfig struct {
-	Root  string `json:"root"`
-	Users []User `json:"users"`
+	Root   string      `json:"root"`
+	Users  []User      `json:"users"`
+	Shares []ShareItem `json:"shares"`
 }
 
 type FileItem struct {
@@ -41,6 +45,22 @@ type FileItem struct {
 	Size     int64  `json:"size"`
 	Path     string `json:"path"`
 	Modified string `json:"modified"`
+}
+
+type DirectoryItem struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+type ShareItem struct {
+	Token      string `json:"token"`
+	Name       string `json:"name"`
+	FullPath   string `json:"full_path"`
+	Permission string `json:"permission"`
+	IsDir      bool   `json:"is_dir"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+	CreatedBy  string `json:"created_by"`
 }
 
 type dynamicWebDAVFS struct{}
@@ -58,6 +78,12 @@ var (
 	errBadPath    = errors.New("invalid path")
 )
 
+const (
+	sharePermissionDownload = "download"
+	sharePermissionView     = "view"
+	sharePermissionEdit     = "edit"
+)
+
 func main() {
 	loadConfig()
 	if err := os.MkdirAll(getCurrentRoot(), 0755); err != nil {
@@ -67,8 +93,10 @@ func main() {
 	httpPort := getHTTPPort()
 
 	http.HandleFunc("/api/disks", basicAuthFunc(apiGetDisks))
+	http.HandleFunc("/api/directories", basicAuthFunc(apiGetDirectories))
 	http.HandleFunc("/api/mount", basicAuthFunc(apiMountDisk))
 	http.HandleFunc("/api/list", basicAuthFunc(apiList))
+	http.HandleFunc("/api/shares", basicAuthFunc(apiShares))
 	http.HandleFunc("/api/mkdir", basicAuthFunc(apiMkdir))
 	http.HandleFunc("/api/upload", basicAuthFunc(apiUpload))
 	http.HandleFunc("/api/delete", basicAuthFunc(apiDelete))
@@ -76,6 +104,7 @@ func main() {
 	http.HandleFunc("/api/zip", basicAuthFunc(apiZip))
 	http.HandleFunc("/api/unzip", basicAuthFunc(apiUnzip))
 	http.HandleFunc("/api/account", basicAuthFunc(apiAccount))
+	http.HandleFunc("/share/", serveShare)
 	http.Handle(davPrefix, basicAuth(http.HandlerFunc(serveWebDAV)))
 	http.HandleFunc("/", basicAuthFunc(page))
 
@@ -109,6 +138,7 @@ func loadConfig() {
 			if len(users) > 0 {
 				cfg.Users = users
 			}
+			cfg.Shares = sanitizeShares(saved.Shares)
 		}
 	}
 
@@ -131,10 +161,12 @@ func writeConfig(cfg AppConfig) error {
 
 func cloneConfig(src AppConfig) AppConfig {
 	dst := AppConfig{
-		Root:  src.Root,
-		Users: make([]User, 0, len(src.Users)),
+		Root:   src.Root,
+		Users:  make([]User, 0, len(src.Users)),
+		Shares: make([]ShareItem, 0, len(src.Shares)),
 	}
 	dst.Users = append(dst.Users, src.Users...)
+	dst.Shares = append(dst.Shares, src.Shares...)
 	return dst
 }
 
@@ -153,6 +185,45 @@ func sanitizeUsers(users []User) []User {
 	return valid
 }
 
+func sanitizeShares(shares []ShareItem) []ShareItem {
+	valid := make([]ShareItem, 0, len(shares))
+	for _, share := range shares {
+		token := strings.TrimSpace(share.Token)
+		fullPath := strings.TrimSpace(share.FullPath)
+		permission, ok := normalizeSharePermission(share.Permission)
+		if token == "" || fullPath == "" || !ok {
+			continue
+		}
+
+		name := strings.TrimSpace(share.Name)
+		if name == "" {
+			name = filepath.Base(fullPath)
+		}
+
+		createdAt := share.CreatedAt
+		if createdAt == "" {
+			createdAt = time.Now().Format("2006-01-02 15:04:05")
+		}
+
+		updatedAt := share.UpdatedAt
+		if updatedAt == "" {
+			updatedAt = createdAt
+		}
+
+		valid = append(valid, ShareItem{
+			Token:      token,
+			Name:       name,
+			FullPath:   fullPath,
+			Permission: permission,
+			IsDir:      share.IsDir,
+			CreatedAt:  createdAt,
+			UpdatedAt:  updatedAt,
+			CreatedBy:  strings.TrimSpace(share.CreatedBy),
+		})
+	}
+	return valid
+}
+
 func getCurrentRoot() string {
 	cfgMu.RLock()
 	defer cfgMu.RUnlock()
@@ -165,6 +236,109 @@ func setCurrentRoot(root string) error {
 	snapshot := cloneConfig(appConfig)
 	cfgMu.Unlock()
 	return writeConfig(snapshot)
+}
+
+func getShares() []ShareItem {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+	items := make([]ShareItem, 0, len(appConfig.Shares))
+	items = append(items, appConfig.Shares...)
+	return items
+}
+
+func normalizeSharePermission(permission string) (string, bool) {
+	switch strings.ToLower(strings.TrimSpace(permission)) {
+	case sharePermissionDownload:
+		return sharePermissionDownload, true
+	case sharePermissionView:
+		return sharePermissionView, true
+	case sharePermissionEdit:
+		return sharePermissionEdit, true
+	default:
+		return "", false
+	}
+}
+
+func createShareLink(name, fullPath, permission, createdBy string, isDir bool) (ShareItem, error) {
+	now := time.Now().Format("2006-01-02 15:04:05")
+	token, err := newShareToken()
+	if err != nil {
+		return ShareItem{}, err
+	}
+
+	share := ShareItem{
+		Token:      token,
+		Name:       name,
+		FullPath:   fullPath,
+		Permission: permission,
+		IsDir:      isDir,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		CreatedBy:  createdBy,
+	}
+
+	cfgMu.Lock()
+	appConfig.Shares = append(appConfig.Shares, share)
+	snapshot := cloneConfig(appConfig)
+	cfgMu.Unlock()
+
+	if err := writeConfig(snapshot); err != nil {
+		return ShareItem{}, err
+	}
+	return share, nil
+}
+
+func updateSharePermission(token, permission string) (ShareItem, error) {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+
+	for i := range appConfig.Shares {
+		if appConfig.Shares[i].Token != token {
+			continue
+		}
+		appConfig.Shares[i].Permission = permission
+		appConfig.Shares[i].UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
+		snapshot := cloneConfig(appConfig)
+		if err := writeConfig(snapshot); err != nil {
+			return ShareItem{}, err
+		}
+		return appConfig.Shares[i], nil
+	}
+	return ShareItem{}, os.ErrNotExist
+}
+
+func deleteShare(token string) error {
+	cfgMu.Lock()
+	defer cfgMu.Unlock()
+
+	for i := range appConfig.Shares {
+		if appConfig.Shares[i].Token != token {
+			continue
+		}
+		appConfig.Shares = append(appConfig.Shares[:i], appConfig.Shares[i+1:]...)
+		return writeConfig(cloneConfig(appConfig))
+	}
+	return os.ErrNotExist
+}
+
+func findShare(token string) (ShareItem, bool) {
+	cfgMu.RLock()
+	defer cfgMu.RUnlock()
+
+	for _, share := range appConfig.Shares {
+		if share.Token == token {
+			return share, true
+		}
+	}
+	return ShareItem{}, false
+}
+
+func newShareToken() (string, error) {
+	buf := make([]byte, 9)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", buf), nil
 }
 
 func findUser(username, password string) (int, User, bool) {
@@ -341,6 +515,58 @@ func apiGetDisks(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func apiGetDirectories(w http.ResponseWriter, r *http.Request) {
+	target := strings.TrimSpace(r.URL.Query().Get("path"))
+	if target == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+
+	full, err := filepath.Abs(target)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	info, err := os.Stat(full)
+	if err != nil || !info.IsDir() {
+		http.Error(w, "directory is not accessible", http.StatusBadRequest)
+		return
+	}
+
+	entries, err := os.ReadDir(full)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	items := make([]DirectoryItem, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		items = append(items, DirectoryItem{
+			Name: entry.Name(),
+			Path: filepath.Join(full, entry.Name()),
+		})
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+	})
+
+	parent := filepath.Dir(full)
+	if parent == "." {
+		parent = full
+	}
+
+	writeJSON(w, map[string]any{
+		"path":   full,
+		"parent": parent,
+		"items":  items,
+	})
+}
+
 func apiMountDisk(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -416,6 +642,575 @@ func apiList(w http.ResponseWriter, r *http.Request) {
 		"path":  virtualPath,
 		"items": items,
 	})
+}
+
+type sharePathsRequest struct {
+	Paths      []string `json:"paths"`
+	Permission string   `json:"permission"`
+}
+
+type shareTokensRequest struct {
+	Tokens     []string `json:"tokens"`
+	Permission string   `json:"permission"`
+}
+
+func apiShares(w http.ResponseWriter, r *http.Request) {
+	_, user, ok := authenticateRequest(r)
+	if !ok {
+		unauthorized(w)
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		items := getShares()
+		sort.Slice(items, func(i, j int) bool {
+			return items[i].UpdatedAt > items[j].UpdatedAt
+		})
+
+		resp := make([]map[string]any, 0, len(items))
+		for _, share := range items {
+			resp = append(resp, shareResponse(r, share))
+		}
+		writeJSON(w, map[string]any{"items": resp})
+	case http.MethodPost:
+		var req sharePathsRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		permission, valid := normalizeSharePermission(req.Permission)
+		if !valid {
+			http.Error(w, "invalid permission", http.StatusBadRequest)
+			return
+		}
+		if len(req.Paths) == 0 {
+			http.Error(w, "paths are required", http.StatusBadRequest)
+			return
+		}
+
+		created := make([]map[string]any, 0, len(req.Paths))
+		for _, virtualPath := range req.Paths {
+			fullPath, err := resolvePath(getCurrentRoot(), virtualPath)
+			if err != nil {
+				http.Error(w, "invalid path", http.StatusBadRequest)
+				return
+			}
+
+			info, err := os.Stat(fullPath)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusNotFound)
+				return
+			}
+
+			name := info.Name()
+			if name == "" {
+				name = filepath.Base(fullPath)
+			}
+
+			share, err := createShareLink(name, fullPath, permission, user.Username, info.IsDir())
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			created = append(created, shareResponse(r, share))
+		}
+
+		writeJSON(w, map[string]any{
+			"ok":    true,
+			"items": created,
+		})
+	case http.MethodPut:
+		var req shareTokensRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		permission, valid := normalizeSharePermission(req.Permission)
+		if !valid {
+			http.Error(w, "invalid permission", http.StatusBadRequest)
+			return
+		}
+		if len(req.Tokens) == 0 {
+			http.Error(w, "tokens are required", http.StatusBadRequest)
+			return
+		}
+
+		updated := make([]map[string]any, 0, len(req.Tokens))
+		for _, token := range req.Tokens {
+			share, err := updateSharePermission(strings.TrimSpace(token), permission)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					http.Error(w, "share not found", http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			updated = append(updated, shareResponse(r, share))
+		}
+
+		writeJSON(w, map[string]any{
+			"ok":    true,
+			"items": updated,
+		})
+	case http.MethodDelete:
+		var req shareTokensRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if len(req.Tokens) == 0 {
+			http.Error(w, "tokens are required", http.StatusBadRequest)
+			return
+		}
+
+		for _, token := range req.Tokens {
+			if err := deleteShare(strings.TrimSpace(token)); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					http.Error(w, "share not found", http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		}
+
+		writeJSON(w, map[string]bool{"ok": true})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func shareResponse(r *http.Request, share ShareItem) map[string]any {
+	return map[string]any{
+		"token":      share.Token,
+		"name":       share.Name,
+		"full_path":  share.FullPath,
+		"permission": share.Permission,
+		"is_dir":     share.IsDir,
+		"created_at": share.CreatedAt,
+		"updated_at": share.UpdatedAt,
+		"created_by": share.CreatedBy,
+		"url":        buildShareURL(r, share.Token),
+	}
+}
+
+func buildShareURL(r *http.Request, token string) string {
+	return requestBaseURL(r) + "/share/" + token
+}
+
+func permissionLabel(permission string) string {
+	switch permission {
+	case sharePermissionDownload:
+		return "只下载"
+	case sharePermissionView:
+		return "可预览"
+	case sharePermissionEdit:
+		return "可编辑"
+	default:
+		return permission
+	}
+}
+
+func requestBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
+			scheme = strings.TrimSpace(parts[0])
+		}
+	}
+	return scheme + "://" + r.Host
+}
+
+func serveShare(w http.ResponseWriter, r *http.Request) {
+	token := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, "/share/"))
+	if token == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	share, ok := findShare(token)
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	info, err := os.Stat(share.FullPath)
+	if err != nil {
+		http.Error(w, "shared item not found", http.StatusNotFound)
+		return
+	}
+
+	switch share.Permission {
+	case sharePermissionDownload:
+		if info.IsDir() {
+			serveShareDownloadDirectory(w, r, share)
+			return
+		}
+		http.ServeFile(w, r, share.FullPath)
+	case sharePermissionView, sharePermissionEdit:
+		if !info.IsDir() && share.Permission == sharePermissionEdit {
+			serveEditableSharedFile(w, r, share)
+			return
+		}
+		if !info.IsDir() {
+			http.ServeFile(w, r, share.FullPath)
+			return
+		}
+		serveShareDirectory(w, r, share)
+	default:
+		http.Error(w, "invalid share permission", http.StatusForbidden)
+	}
+}
+
+func serveShareDownloadDirectory(w http.ResponseWriter, r *http.Request, share ShareItem) {
+	if r.URL.Query().Get("download") == "1" {
+		filename := share.Name
+		if filename == "" {
+			filename = "shared-folder"
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.zip"`, strings.ReplaceAll(filename, `"`, "")))
+
+		zw := zip.NewWriter(w)
+		if err := writeZipContents(zw, share.FullPath, filepath.Dir(share.FullPath)); err != nil {
+			_ = zw.Close()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = zw.Close()
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>目录分享</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f4f6fb;color:#1f2937}.wrap{max-width:760px;margin:0 auto;padding:24px 16px}.panel{background:#fff;border:1px solid #dbe3ef;border-radius:8px;padding:24px}a.button{display:inline-flex;align-items:center;justify-content:center;height:40px;padding:0 16px;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none}p{color:#6b7280;line-height:1.7}</style></head><body><div class="wrap"><div class="panel"><h2 style="margin-top:0">` + htmlEscape(share.Name) + `</h2><p>这个分享链接被设置为只下载。点击下面的按钮即可下载当前目录的 ZIP 压缩包。</p><a class="button" href="?download=1">下载 ZIP</a></div></div></body></html>`))
+}
+
+func serveEditableSharedFile(w http.ResponseWriter, r *http.Request, share ShareItem) {
+	if r.Method == http.MethodGet && r.URL.Query().Get("download") == "1" {
+		http.ServeFile(w, r, share.FullPath)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		file, header, err := r.FormFile("file")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer file.Close()
+
+		filename := filepath.Base(header.Filename)
+		if filename == "" || filename == "." {
+			http.Error(w, "invalid file name", http.StatusBadRequest)
+			return
+		}
+
+		dst, err := os.Create(share.FullPath)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer dst.Close()
+
+		if _, err := io.Copy(dst, file); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		http.Redirect(w, r, r.URL.Path+"?updated=1", http.StatusSeeOther)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	message := ""
+	if r.URL.Query().Get("updated") == "1" {
+		message = `<p style="color:#047857">文件已经替换成功。</p>`
+	}
+	_, _ = w.Write([]byte(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>编辑分享文件</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f4f6fb;color:#1f2937}.wrap{max-width:760px;margin:0 auto;padding:24px 16px}.panel{background:#fff;border:1px solid #dbe3ef;border-radius:8px;padding:24px}a.button,button{display:inline-flex;align-items:center;justify-content:center;height:40px;padding:0 16px;border-radius:8px;background:#2563eb;color:#fff;text-decoration:none;border:none;cursor:pointer}input[type=file]{margin:12px 0}.muted{color:#6b7280;line-height:1.7}</style></head><body><div class="wrap"><div class="panel"><h2 style="margin-top:0">` + htmlEscape(share.Name) + `</h2><p class="muted">这个文件分享允许编辑。你可以直接下载原文件，或者上传新文件覆盖它。</p>` + message + `<p><a class="button" href="` + htmlEscape(r.URL.Path) + `?download=1">下载当前文件</a></p><form method="post" enctype="multipart/form-data"><input type="file" name="file" required><br><button type="submit">上传并替换</button></form></div></div></body></html>`))
+}
+
+func writeZipContents(writer *zip.Writer, sourcePath, baseDir string) error {
+	return filepath.Walk(sourcePath, func(current string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+
+		rel, err := filepath.Rel(baseDir, current)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+
+		if info.IsDir() {
+			if rel == "." {
+				return nil
+			}
+			_, err := writer.Create(rel + "/")
+			return err
+		}
+
+		header, err := zip.FileInfoHeader(info)
+		if err != nil {
+			return err
+		}
+		header.Name = rel
+		header.Method = zip.Deflate
+
+		dst, err := writer.CreateHeader(header)
+		if err != nil {
+			return err
+		}
+
+		src, err := os.Open(current)
+		if err != nil {
+			return err
+		}
+		defer src.Close()
+
+		_, err = io.Copy(dst, src)
+		return err
+	})
+}
+
+func serveShareDirectory(w http.ResponseWriter, r *http.Request, share ShareItem) {
+	rel := cleanVirtualPath(r.URL.Query().Get("path"))
+	if rel == "/" {
+		rel = "/"
+	}
+
+	target, err := resolvePath(share.FullPath, rel)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+
+	info, err := os.Stat(target)
+	if err != nil {
+		http.Error(w, "path not found", http.StatusNotFound)
+		return
+	}
+
+	if !info.IsDir() {
+		if share.Permission == sharePermissionDownload || share.Permission == sharePermissionView || share.Permission == sharePermissionEdit {
+			http.ServeFile(w, r, target)
+			return
+		}
+	}
+
+	if r.Method == http.MethodPost {
+		if share.Permission != sharePermissionEdit {
+			http.Error(w, "share is read-only", http.StatusForbidden)
+			return
+		}
+		action := strings.TrimSpace(r.FormValue("action"))
+		switch action {
+		case "mkdir":
+			name := strings.TrimSpace(r.FormValue("name"))
+			if name == "" || strings.ContainsAny(name, `/\`) {
+				http.Error(w, "invalid folder name", http.StatusBadRequest)
+				return
+			}
+			if err := os.MkdirAll(filepath.Join(target, name), 0755); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		case "delete":
+			targetRel := cleanVirtualPath(r.FormValue("target"))
+			if targetRel == "/" {
+				http.Error(w, "root cannot be deleted", http.StatusBadRequest)
+				return
+			}
+			deleteTarget, err := resolvePath(share.FullPath, targetRel)
+			if err != nil {
+				http.Error(w, "invalid delete path", http.StatusBadRequest)
+				return
+			}
+			if err := os.RemoveAll(deleteTarget); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		case "upload":
+			file, header, err := r.FormFile("file")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer file.Close()
+
+			filename := filepath.Base(header.Filename)
+			if filename == "" || filename == "." {
+				http.Error(w, "invalid file name", http.StatusBadRequest)
+				return
+			}
+			dst, err := os.Create(filepath.Join(target, filename))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer dst.Close()
+			if _, err := io.Copy(dst, file); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+		default:
+			http.Error(w, "unsupported action", http.StatusBadRequest)
+			return
+		}
+		http.Redirect(w, r, r.URL.Path+"?path="+urlQueryEscape(rel), http.StatusSeeOther)
+		return
+	}
+
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	items := make([]FileItem, 0, len(entries))
+	for _, entry := range entries {
+		entryInfo, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		items = append(items, FileItem{
+			Name:     entry.Name(),
+			IsDir:    entry.IsDir(),
+			Size:     entryInfo.Size(),
+			Path:     pathpkg.Join(rel, entry.Name()),
+			Modified: entryInfo.ModTime().Format("2006-01-02 15:04"),
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsDir != items[j].IsDir {
+			return items[i].IsDir
+		}
+		return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+	})
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(renderSharePage(r, share, rel, items)))
+}
+
+func urlQueryEscape(value string) string {
+	replacer := strings.NewReplacer("%", "%25", " ", "%20", "#", "%23", "&", "%26", "+", "%2B", "?", "%3F")
+	return replacer.Replace(value)
+}
+
+func renderSharePage(r *http.Request, share ShareItem, currentPath string, items []FileItem) string {
+	var builder strings.Builder
+	builder.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>分享 - `)
+	builder.WriteString(htmlEscape(share.Name))
+	builder.WriteString(`</title><style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:0;background:#f4f6fb;color:#1f2937}
+.wrap{max-width:1100px;margin:0 auto;padding:24px 16px}
+.panel{background:#fff;border:1px solid #dbe3ef;border-radius:8px;padding:18px}
+.head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-bottom:16px}
+.meta{color:#6b7280;font-size:14px;display:grid;gap:6px}
+.bar{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}
+button,input[type="text"]{height:38px;border-radius:8px}
+button{padding:0 14px;border:none;background:#2563eb;color:#fff;cursor:pointer}
+button.secondary{background:#fff;color:#1f2937;border:1px solid #cfd8e3}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:12px;border-bottom:1px solid #edf1f7;font-size:14px}
+a{text-decoration:none;color:#1d4ed8}
+form.inline{display:inline-flex;gap:8px;flex-wrap:wrap}
+.muted{color:#6b7280}
+</style></head><body><div class="wrap"><div class="panel">`)
+	builder.WriteString(`<div class="head"><div><h2 style="margin:0 0 8px 0">`)
+	builder.WriteString(htmlEscape(share.Name))
+	builder.WriteString(`</h2><div class="meta"><div>权限: `)
+	builder.WriteString(htmlEscape(permissionLabel(share.Permission)))
+	builder.WriteString(`</div><div>创建者: `)
+	builder.WriteString(htmlEscape(share.CreatedBy))
+	builder.WriteString(`</div><div>路径: `)
+	builder.WriteString(htmlEscape(currentPath))
+	builder.WriteString(`</div></div></div>`)
+
+	if share.Permission == sharePermissionEdit {
+		builder.WriteString(`<div class="bar"><form method="post" class="inline"><input type="hidden" name="action" value="mkdir"><input type="text" name="name" placeholder="新建文件夹名称"><button type="submit">新建文件夹</button></form><form method="post" enctype="multipart/form-data" class="inline"><input type="hidden" name="action" value="upload"><input type="file" name="file"><button type="submit">上传文件</button></form></div>`)
+	}
+
+	builder.WriteString(`</div><table><thead><tr><th>名称</th><th>类型</th><th>大小</th><th>修改时间</th><th>操作</th></tr></thead><tbody>`)
+	if currentPath != "/" {
+		parent := pathpkg.Dir(currentPath)
+		if parent == "." {
+			parent = "/"
+		}
+		builder.WriteString(`<tr><td><a href="?path=` + htmlEscape(urlQueryEscape(parent)) + `">..</a></td><td class="muted">上级目录</td><td>-</td><td>-</td><td></td></tr>`)
+	}
+
+	for _, item := range items {
+		builder.WriteString(`<tr><td>`)
+		if item.IsDir {
+			builder.WriteString(`<a href="?path=` + htmlEscape(urlQueryEscape(item.Path)) + `">` + htmlEscape(item.Name) + `</a>`)
+		} else {
+			builder.WriteString(`<a href="?path=` + htmlEscape(urlQueryEscape(item.Path)) + `">` + htmlEscape(item.Name) + `</a>`)
+		}
+		builder.WriteString(`</td><td>`)
+		if item.IsDir {
+			builder.WriteString(`目录`)
+		} else {
+			builder.WriteString(`文件`)
+		}
+		builder.WriteString(`</td><td>`)
+		if item.IsDir {
+			builder.WriteString(`-`)
+		} else {
+			builder.WriteString(htmlEscape(formatSizeJS(item.Size)))
+		}
+		builder.WriteString(`</td><td>` + htmlEscape(item.Modified) + `</td><td>`)
+		if !item.IsDir {
+			builder.WriteString(`<a href="?path=` + htmlEscape(urlQueryEscape(item.Path)) + `">打开</a>`)
+		} else {
+			builder.WriteString(`<a href="?path=` + htmlEscape(urlQueryEscape(item.Path)) + `">进入</a>`)
+		}
+		if share.Permission == sharePermissionEdit && currentPath != "/" {
+			builder.WriteString(``)
+		}
+		if share.Permission == sharePermissionEdit {
+			builder.WriteString(` <form method="post" class="inline" onsubmit="return confirm('确定删除这个项目吗？')"><input type="hidden" name="action" value="delete"><input type="hidden" name="target" value="` + htmlEscape(item.Path) + `"><button type="submit" class="secondary">删除</button></form>`)
+		}
+		builder.WriteString(`</td></tr>`)
+	}
+
+	builder.WriteString(`</tbody></table></div></div></body></html>`)
+	return builder.String()
+}
+
+func htmlEscape(value string) string {
+	replacer := strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&#39;",
+	)
+	return replacer.Replace(value)
+}
+
+func formatSizeJS(size int64) string {
+	if size <= 0 {
+		return "-"
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	value := float64(size)
+	index := 0
+	for value >= 1024 && index < len(units)-1 {
+		value = value / 1024
+		index++
+	}
+	if index == 0 {
+		return fmt.Sprintf("%.0f %s", value, units[index])
+	}
+	return fmt.Sprintf("%.1f %s", value, units[index])
 }
 
 func apiMkdir(w http.ResponseWriter, r *http.Request) {
@@ -979,6 +1774,71 @@ const pageHTML = `<!DOCTYPE html>
             color:#6b7280;
             font-size:14px;
         }
+        .share-panel{
+            margin-top:18px;
+            background:#ffffff;
+            border:1px solid #dbe3ef;
+            border-radius:8px;
+            padding:16px;
+        }
+        .share-panel h3{
+            margin:0 0 14px 0;
+            font-size:18px;
+        }
+        .share-list{
+            display:grid;
+            gap:10px;
+        }
+        .share-item{
+            display:grid;
+            gap:10px;
+            padding:12px;
+            border:1px solid #e5ebf4;
+            border-radius:8px;
+        }
+        .share-top{
+            display:flex;
+            justify-content:space-between;
+            gap:12px;
+            align-items:flex-start;
+            flex-wrap:wrap;
+        }
+        .share-title{
+            font-weight:600;
+            word-break:break-word;
+        }
+        .share-meta{
+            color:#6b7280;
+            font-size:13px;
+            display:grid;
+            gap:4px;
+        }
+        .share-link{
+            width:100%;
+            height:38px;
+            padding:0 12px;
+            border:1px solid #cfd8e3;
+            border-radius:8px;
+            background:#f8fafc;
+            color:#111827;
+        }
+        .permission-badge{
+            display:inline-flex;
+            align-items:center;
+            justify-content:center;
+            min-width:68px;
+            height:28px;
+            padding:0 10px;
+            border-radius:999px;
+            background:#eff6ff;
+            color:#1d4ed8;
+            font-size:12px;
+            font-weight:600;
+        }
+        .share-empty{
+            color:#6b7280;
+            padding:10px 0 2px;
+        }
         .status{
             margin-top:12px;
             min-height:22px;
@@ -1310,6 +2170,8 @@ let viewMode = localStorage.getItem("gowebdav-view") || "list";
 let fileItems = [];
 let selected = new Set();
 let previewObjectUrl = "";
+let shareItems = [];
+let selectedShares = new Set();
 
 function byId(id) {
     return document.getElementById(id);
@@ -1348,6 +2210,11 @@ async function apiFetch(url, options) {
 async function apiJSON(url, options) {
     const response = await apiFetch(url, options);
     return response.json();
+}
+
+async function apiText(url, options) {
+    const response = await apiFetch(url, options);
+    return response.text();
 }
 
 function formBody(data) {
@@ -1983,7 +2850,300 @@ async function saveAccount() {
     }
 }
 
+function permissionText(permission) {
+    if (permission === "download") return "只下载";
+    if (permission === "view") return "可预览";
+    if (permission === "edit") return "可编辑";
+    return permission || "-";
+}
+
+function selectedPaths() {
+    return Array.from(selected);
+}
+
+function selectedShareTokens() {
+    return Array.from(selectedShares);
+}
+
+function ensureShareUI() {
+    if (byId("shareList")) {
+        return;
+    }
+
+    const uploadButton = document.querySelector('.button-group button[onclick="triggerUpload()"]');
+    if (uploadButton && uploadButton.parentElement) {
+        const createBtn = document.createElement("button");
+        createBtn.className = "secondary";
+        createBtn.textContent = "创建分享";
+        createBtn.onclick = openShareCreateModal;
+        uploadButton.parentElement.insertBefore(createBtn, uploadButton.nextSibling);
+
+        const batchBtn = document.createElement("button");
+        batchBtn.className = "secondary";
+        batchBtn.textContent = "批量权限";
+        batchBtn.onclick = openSharePermissionModal;
+        uploadButton.parentElement.insertBefore(batchBtn, createBtn.nextSibling);
+    }
+
+    const app = document.querySelector(".app");
+    const fileList = byId("fileList");
+    if (app && fileList) {
+        const panel = document.createElement("div");
+        panel.className = "share-panel";
+        panel.innerHTML = '<div class="topbar" style="margin-bottom:14px;align-items:center">' +
+            '<div><h3>分享管理</h3><p style="margin:6px 0 0;color:#6b7280;font-size:14px">支持只下载、可预览和可编辑三种权限。</p></div>' +
+            '<div class="button-group"><button class="secondary" type="button" onclick="loadShares()">刷新分享</button></div>' +
+            '</div><div id="shareList" class="share-list"></div>';
+        app.appendChild(panel);
+    }
+
+    const accountModal = byId("accountModal");
+    if (accountModal && accountModal.parentElement) {
+        const createModal = document.createElement("div");
+        createModal.id = "shareCreateModal";
+        createModal.className = "modal";
+        createModal.innerHTML = '<div class="dialog"><div class="dialog-head"><h3>创建分享</h3>' +
+            '<button class="close-btn tiny" type="button" onclick="closeShareCreateModal()">关闭</button></div>' +
+            '<div class="form-grid"><div><label for="sharePermission">分享权限</label>' +
+            '<select id="sharePermission"><option value="download">只下载</option><option value="view">可预览 + 下载</option><option value="edit">可编辑</option></select></div>' +
+            '<p id="shareCreateHint">请选择文件或文件夹后批量创建分享。</p>' +
+            '<div class="button-group"><button type="button" onclick="createShares()">立即创建</button>' +
+            '<button class="secondary" type="button" onclick="closeShareCreateModal()">取消</button></div></div></div>';
+
+        const permissionModal = document.createElement("div");
+        permissionModal.id = "sharePermissionModal";
+        permissionModal.className = "modal";
+        permissionModal.innerHTML = '<div class="dialog"><div class="dialog-head"><h3>批量设置权限</h3>' +
+            '<button class="close-btn tiny" type="button" onclick="closeSharePermissionModal()">关闭</button></div>' +
+            '<div class="form-grid"><div><label for="sharePermissionBatch">新权限</label>' +
+            '<select id="sharePermissionBatch"><option value="download">只下载</option><option value="view">可预览 + 下载</option><option value="edit">可编辑</option></select></div>' +
+            '<p id="sharePermissionHint">先在分享管理列表中勾选要修改的分享项。</p>' +
+            '<div class="button-group"><button type="button" onclick="applySharePermission()">保存权限</button>' +
+            '<button class="secondary" type="button" onclick="closeSharePermissionModal()">取消</button></div></div></div>';
+
+        accountModal.parentElement.appendChild(createModal);
+        accountModal.parentElement.appendChild(permissionModal);
+    }
+}
+function renderShares() {
+    const list = byId("shareList");
+    if (!list) {
+        return;
+    }
+
+    list.innerHTML = "";
+    if (!shareItems.length) {
+        const empty = document.createElement("div");
+        empty.className = "share-empty";
+        empty.textContent = "还没有分享链接。";
+        list.appendChild(empty);
+        return;
+    }
+
+    shareItems.forEach(function(item) {
+        const row = document.createElement("div");
+        row.className = "share-item";
+
+        const top = document.createElement("div");
+        top.className = "share-top";
+
+        const left = document.createElement("div");
+        left.style.display = "grid";
+        left.style.gap = "8px";
+
+        const title = document.createElement("div");
+        title.className = "share-title";
+        title.textContent = item.name;
+        left.appendChild(title);
+
+        const meta = document.createElement("div");
+        meta.className = "share-meta";
+        meta.innerHTML = "<div>创建人: " + (item.created_by || "-") + "</div><div>路径: " + (item.full_path || "-") + "</div><div>更新时间: " + (item.updated_at || "-") + "</div>";
+        left.appendChild(meta);
+        top.appendChild(left);
+
+        const right = document.createElement("div");
+        right.style.display = "grid";
+        right.style.gap = "8px";
+        right.style.justifyItems = "end";
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = selectedShares.has(item.token);
+        checkbox.onchange = function(event) {
+            if (event.target.checked) selectedShares.add(item.token);
+            else selectedShares.delete(item.token);
+        };
+        right.appendChild(checkbox);
+
+        const badge = document.createElement("span");
+        badge.className = "permission-badge";
+        badge.textContent = permissionText(item.permission);
+        right.appendChild(badge);
+        top.appendChild(right);
+
+        const link = document.createElement("input");
+        link.className = "share-link";
+        link.readOnly = true;
+        link.value = item.url || "";
+
+        const actions = document.createElement("div");
+        actions.className = "actions";
+        actions.appendChild(makeActionButton("复制链接", "secondary", function() {
+            copyShareLink(item.url || "");
+        }));
+        actions.appendChild(makeActionButton("打开", "secondary", function() {
+            window.open(item.url, "_blank");
+        }));
+        actions.appendChild(makeActionButton("删除分享", "secondary", function() {
+            removeShares([item.token]);
+        }));
+
+        row.appendChild(top);
+        row.appendChild(link);
+        row.appendChild(actions);
+        list.appendChild(row);
+    });
+}
+
+async function loadShares() {
+    try {
+        const data = await apiJSON("/api/shares");
+        shareItems = Array.isArray(data.items) ? data.items : [];
+        renderShares();
+    } catch (error) {
+        setStatus(error.message, "error");
+    }
+}
+
+function openShareCreateModal() {
+    const paths = selectedPaths();
+    if (!paths.length) {
+        alert("请先选择要分享的文件或文件夹");
+        return;
+    }
+    byId("shareCreateHint").textContent = "将为 " + paths.length + " 个项目创建分享链接。";
+    byId("shareCreateModal").classList.add("open");
+}
+
+function closeShareCreateModal() {
+    const modal = byId("shareCreateModal");
+    if (modal) modal.classList.remove("open");
+}
+
+async function createShares() {
+    const paths = selectedPaths();
+    if (!paths.length) {
+        alert("请先选择要分享的项目");
+        return;
+    }
+
+    try {
+        setStatus("正在创建分享链接...", "loading");
+        await apiJSON("/api/shares", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                paths: paths,
+                permission: byId("sharePermission").value
+            })
+        });
+        closeShareCreateModal();
+        await loadShares();
+        setStatus("分享链接已创建", "success");
+    } catch (error) {
+        setStatus(error.message, "error");
+    }
+}
+
+function openSharePermissionModal() {
+    const tokens = selectedShareTokens();
+    if (!tokens.length) {
+        alert("请先在分享管理中勾选分享项");
+        return;
+    }
+    byId("sharePermissionHint").textContent = "将批量修改 " + tokens.length + " 个分享的权限。";
+    byId("sharePermissionModal").classList.add("open");
+}
+
+function closeSharePermissionModal() {
+    const modal = byId("sharePermissionModal");
+    if (modal) modal.classList.remove("open");
+}
+
+async function applySharePermission() {
+    const tokens = selectedShareTokens();
+    if (!tokens.length) {
+        alert("请先勾选要修改的分享");
+        return;
+    }
+
+    try {
+        setStatus("正在批量修改分享权限...", "loading");
+        await apiJSON("/api/shares", {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                tokens: tokens,
+                permission: byId("sharePermissionBatch").value
+            })
+        });
+        closeSharePermissionModal();
+        await loadShares();
+        setStatus("分享权限已更新", "success");
+    } catch (error) {
+        setStatus(error.message, "error");
+    }
+}
+
+async function removeShares(tokens) {
+    if (!tokens.length) {
+        return;
+    }
+    if (!confirm("确定删除选中的分享链接吗？")) {
+        return;
+    }
+
+    try {
+        setStatus("正在删除分享链接...", "loading");
+        await apiJSON("/api/shares", {
+            method: "DELETE",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tokens: tokens })
+        });
+        tokens.forEach(function(token) {
+            selectedShares.delete(token);
+        });
+        await loadShares();
+        setStatus("分享链接已删除", "success");
+    } catch (error) {
+        setStatus(error.message, "error");
+    }
+}
+
+async function copyShareLink(link) {
+    if (!link) {
+        return;
+    }
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(link);
+        } else {
+            const temp = document.createElement("input");
+            temp.value = link;
+            document.body.appendChild(temp);
+            temp.select();
+            document.execCommand("copy");
+            temp.remove();
+        }
+        setStatus("分享链接已复制", "success");
+    } catch (error) {
+        setStatus("复制链接失败，请手动复制", "error");
+    }
+}
+
 async function init() {
+    ensureShareUI();
     byId("uploadInput").addEventListener("change", handleUpload);
     setViewMode(viewMode);
     updateSelectionSummary();
@@ -1991,6 +3151,7 @@ async function init() {
         await loadDisks();
         await loadAccount();
         await loadFiles();
+        await loadShares();
     } catch (error) {
         setStatus(error.message, "error");
     }
