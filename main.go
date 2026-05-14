@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"os"
 	pathpkg "path"
@@ -17,15 +19,20 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/net/webdav"
 )
 
 const (
-	defaultHTTPPort = ":8081"
-	davPrefix       = "/dav/"
-	configPath      = "./disk_config.json"
+	defaultHTTPPort   = ":18090"
+	davPrefix         = "/dav/"
+	configPath        = "./disk_config.json"
+	maxTextPreviewLen = 256 * 1024
+	uploadMemoryLimit = 64 << 20
+	listCacheTTL      = 3 * time.Second
 )
 
 type User struct {
@@ -47,6 +54,10 @@ type FileItem struct {
 	Modified string `json:"modified"`
 }
 
+type batchPathRequest struct {
+	Paths []string `json:"paths"`
+}
+
 type DirectoryItem struct {
 	Name string `json:"name"`
 	Path string `json:"path"`
@@ -65,6 +76,12 @@ type ShareItem struct {
 
 type dynamicWebDAVFS struct{}
 
+type listCacheEntry struct {
+	Items      []FileItem
+	ExpiresAt  time.Time
+	Generation uint64
+}
+
 var (
 	defaultConfig = AppConfig{
 		Root: "./files",
@@ -76,6 +93,9 @@ var (
 	appConfig     = cloneConfig(defaultConfig)
 	davLockSystem = webdav.NewMemLS()
 	errBadPath    = errors.New("invalid path")
+	listCacheMu   sync.RWMutex
+	listCache     = map[string]listCacheEntry{}
+	listGen       uint64
 )
 
 const (
@@ -101,6 +121,7 @@ func main() {
 	http.HandleFunc("/api/upload", basicAuthFunc(apiUpload))
 	http.HandleFunc("/api/delete", basicAuthFunc(apiDelete))
 	http.HandleFunc("/api/download", basicAuthFunc(apiDownload))
+	http.HandleFunc("/api/preview", basicAuthFunc(apiPreview))
 	http.HandleFunc("/api/zip", basicAuthFunc(apiZip))
 	http.HandleFunc("/api/unzip", basicAuthFunc(apiUnzip))
 	http.HandleFunc("/api/account", basicAuthFunc(apiAccount))
@@ -235,7 +256,11 @@ func setCurrentRoot(root string) error {
 	appConfig.Root = root
 	snapshot := cloneConfig(appConfig)
 	cfgMu.Unlock()
-	return writeConfig(snapshot)
+	if err := writeConfig(snapshot); err != nil {
+		return err
+	}
+	invalidateListCache()
+	return nil
 }
 
 func getShares() []ShareItem {
@@ -400,7 +425,11 @@ func (dynamicWebDAVFS) Mkdir(_ context.Context, name string, perm os.FileMode) e
 	if err != nil {
 		return err
 	}
-	return os.MkdirAll(full, perm)
+	if err := os.MkdirAll(full, perm); err != nil {
+		return err
+	}
+	invalidateListCache()
+	return nil
 }
 
 func (dynamicWebDAVFS) OpenFile(_ context.Context, name string, flag int, perm os.FileMode) (webdav.File, error) {
@@ -413,7 +442,11 @@ func (dynamicWebDAVFS) OpenFile(_ context.Context, name string, flag int, perm o
 			return nil, err
 		}
 	}
-	return os.OpenFile(full, flag, perm)
+	file, err := os.OpenFile(full, flag, perm)
+	if err == nil && flag&(os.O_CREATE|os.O_WRONLY|os.O_RDWR|os.O_APPEND|os.O_TRUNC) != 0 {
+		invalidateListCache()
+	}
+	return file, err
 }
 
 func (dynamicWebDAVFS) RemoveAll(_ context.Context, name string) error {
@@ -424,7 +457,11 @@ func (dynamicWebDAVFS) RemoveAll(_ context.Context, name string) error {
 	if err != nil {
 		return err
 	}
-	return os.RemoveAll(full)
+	if err := os.RemoveAll(full); err != nil {
+		return err
+	}
+	invalidateListCache()
+	return nil
 }
 
 func (dynamicWebDAVFS) Rename(_ context.Context, oldName, newName string) error {
@@ -439,7 +476,11 @@ func (dynamicWebDAVFS) Rename(_ context.Context, oldName, newName string) error 
 	if err := os.MkdirAll(filepath.Dir(newFull), 0755); err != nil {
 		return err
 	}
-	return os.Rename(oldFull, newFull)
+	if err := os.Rename(oldFull, newFull); err != nil {
+		return err
+	}
+	invalidateListCache()
+	return nil
 }
 
 func (dynamicWebDAVFS) Stat(_ context.Context, name string) (os.FileInfo, error) {
@@ -488,6 +529,269 @@ func resolvePath(root, virtualPath string) (string, error) {
 func writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+func cloneFileItems(items []FileItem) []FileItem {
+	if len(items) == 0 {
+		return []FileItem{}
+	}
+	cloned := make([]FileItem, len(items))
+	copy(cloned, items)
+	return cloned
+}
+
+func invalidateListCache() {
+	atomic.AddUint64(&listGen, 1)
+	listCacheMu.Lock()
+	clear(listCache)
+	listCacheMu.Unlock()
+}
+
+func cachedFileItems(fullPath string) ([]FileItem, bool) {
+	listCacheMu.RLock()
+	entry, ok := listCache[fullPath]
+	listCacheMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if entry.Generation != atomic.LoadUint64(&listGen) || time.Now().After(entry.ExpiresAt) {
+		return nil, false
+	}
+	return cloneFileItems(entry.Items), true
+}
+
+func storeFileItems(fullPath string, items []FileItem) {
+	listCacheMu.Lock()
+	listCache[fullPath] = listCacheEntry{
+		Items:      cloneFileItems(items),
+		ExpiresAt:  time.Now().Add(listCacheTTL),
+		Generation: atomic.LoadUint64(&listGen),
+	}
+	listCacheMu.Unlock()
+}
+
+func normalizeVirtualPaths(rawPaths []string) []string {
+	if len(rawPaths) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(rawPaths))
+	paths := make([]string, 0, len(rawPaths))
+	for _, raw := range rawPaths {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		cleaned := cleanVirtualPath(trimmed)
+		if _, ok := seen[cleaned]; ok {
+			continue
+		}
+		seen[cleaned] = struct{}{}
+		paths = append(paths, cleaned)
+	}
+	return paths
+}
+
+func readBatchPaths(r *http.Request) ([]string, error) {
+	if strings.Contains(strings.ToLower(r.Header.Get("Content-Type")), "application/json") {
+		var req batchPathRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return nil, err
+		}
+		paths := normalizeVirtualPaths(req.Paths)
+		if len(paths) == 0 {
+			return nil, errors.New("paths are required")
+		}
+		return paths, nil
+	}
+
+	if err := r.ParseForm(); err != nil {
+		return nil, err
+	}
+	rawPaths := append([]string{}, r.Form["paths"]...)
+	rawPaths = append(rawPaths, r.Form["path"]...)
+	paths := normalizeVirtualPaths(rawPaths)
+	if len(paths) == 0 {
+		return nil, errors.New("paths are required")
+	}
+	return paths, nil
+}
+
+func collectUploadFiles(form *multipart.Form) []*multipart.FileHeader {
+	if form == nil || len(form.File) == 0 {
+		return nil
+	}
+	files := make([]*multipart.FileHeader, 0)
+	if named := form.File["files"]; len(named) > 0 {
+		files = append(files, named...)
+	}
+	if named := form.File["file"]; len(named) > 0 {
+		files = append(files, named...)
+	}
+	if len(files) > 0 {
+		return files
+	}
+	for _, headers := range form.File {
+		files = append(files, headers...)
+	}
+	return files
+}
+
+func sanitizeUploadName(name string) string {
+	normalized := strings.ReplaceAll(strings.TrimSpace(name), "\\", "/")
+	return pathpkg.Base(normalized)
+}
+
+func saveUploadedFile(targetDir string, header *multipart.FileHeader) error {
+	filename := sanitizeUploadName(header.Filename)
+	if filename == "." || filename == "/" || filename == "" {
+		return errors.New("invalid file name")
+	}
+
+	src, err := header.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	dst, err := os.Create(filepath.Join(targetDir, filename))
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
+	_, err = io.Copy(dst, src)
+	return err
+}
+
+func previewKindFromName(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg":
+		return "image"
+	case ".mp4", ".webm", ".ogg", ".mov", ".m4v":
+		return "video"
+	case ".mp3", ".wav", ".m4a", ".flac", ".aac", ".oga":
+		return "audio"
+	case ".pdf":
+		return "pdf"
+	case ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".log", ".csv",
+		".xml", ".html", ".htm", ".css", ".js", ".jsx", ".ts", ".tsx", ".vue", ".go", ".py", ".java",
+		".rb", ".rs", ".php", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".sh", ".bash", ".ps1", ".sql":
+		return "text"
+	default:
+		return ""
+	}
+}
+
+func looksLikeText(sample []byte) bool {
+	if len(sample) == 0 {
+		return true
+	}
+	if !utf8.Valid(sample) {
+		return false
+	}
+	for _, b := range sample {
+		if b == 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func previewKindForFile(name string, sample []byte) string {
+	if kind := previewKindFromName(name); kind != "" {
+		return kind
+	}
+
+	contentType := strings.ToLower(http.DetectContentType(sample))
+	switch {
+	case strings.HasPrefix(contentType, "image/"):
+		return "image"
+	case strings.HasPrefix(contentType, "video/"):
+		return "video"
+	case strings.HasPrefix(contentType, "audio/"):
+		return "audio"
+	case contentType == "application/pdf":
+		return "pdf"
+	case strings.HasPrefix(contentType, "text/"),
+		strings.Contains(contentType, "json"),
+		strings.Contains(contentType, "xml"),
+		strings.Contains(contentType, "javascript"):
+		return "text"
+	case looksLikeText(sample):
+		return "text"
+	default:
+		return ""
+	}
+}
+
+func buildFileItems(fullDir, virtualPath string) ([]FileItem, error) {
+	entries, err := os.ReadDir(fullDir)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(entries) == 0 {
+		return []FileItem{}, nil
+	}
+
+	results := make([]FileItem, len(entries))
+	valid := make([]bool, len(entries))
+
+	workerCount := runtime.NumCPU() * 2
+	if workerCount < 4 {
+		workerCount = 4
+	}
+	if workerCount > len(entries) {
+		workerCount = len(entries)
+	}
+	if workerCount > 16 {
+		workerCount = 16
+	}
+
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				entry := entries[idx]
+				info, infoErr := entry.Info()
+				if infoErr != nil {
+					continue
+				}
+				results[idx] = FileItem{
+					Name:     entry.Name(),
+					IsDir:    entry.IsDir(),
+					Size:     info.Size(),
+					Path:     pathpkg.Join(virtualPath, entry.Name()),
+					Modified: info.ModTime().Format("2006-01-02 15:04"),
+				}
+				valid[idx] = true
+			}
+		}()
+	}
+
+	for idx := range entries {
+		jobs <- idx
+	}
+	close(jobs)
+	wg.Wait()
+
+	items := make([]FileItem, 0, len(entries))
+	for idx, ok := range valid {
+		if ok {
+			items = append(items, results[idx])
+		}
+	}
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].IsDir != items[j].IsDir {
+			return items[i].IsDir
+		}
+		return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
+	})
+	return items, nil
 }
 
 func apiGetDisks(w http.ResponseWriter, r *http.Request) {
@@ -610,33 +914,15 @@ func apiList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, err := os.ReadDir(full)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	items := make([]FileItem, 0, len(entries))
-	for _, entry := range entries {
-		info, err := entry.Info()
+	items, ok := cachedFileItems(full)
+	if !ok {
+		items, err = buildFileItems(full, virtualPath)
 		if err != nil {
-			continue
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		items = append(items, FileItem{
-			Name:     entry.Name(),
-			IsDir:    entry.IsDir(),
-			Size:     info.Size(),
-			Path:     pathpkg.Join(virtualPath, entry.Name()),
-			Modified: info.ModTime().Format("2006-01-02 15:04"),
-		})
+		storeFileItems(full, items)
 	}
-
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].IsDir != items[j].IsDir {
-			return items[i].IsDir
-		}
-		return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
-	})
 
 	writeJSON(w, map[string]any{
 		"path":  virtualPath,
@@ -924,6 +1210,7 @@ func serveEditableSharedFile(w http.ResponseWriter, r *http.Request, share Share
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		invalidateListCache()
 
 		http.Redirect(w, r, r.URL.Path+"?updated=1", http.StatusSeeOther)
 		return
@@ -973,10 +1260,13 @@ func writeZipContents(writer *zip.Writer, sourcePath, baseDir string) error {
 		if err != nil {
 			return err
 		}
-		defer src.Close()
 
-		_, err = io.Copy(dst, src)
-		return err
+		_, copyErr := io.Copy(dst, src)
+		closeErr := src.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
 	})
 }
 
@@ -1022,6 +1312,7 @@ func serveShareDirectory(w http.ResponseWriter, r *http.Request, share ShareItem
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			invalidateListCache()
 		case "delete":
 			targetRel := cleanVirtualPath(r.FormValue("target"))
 			if targetRel == "/" {
@@ -1037,6 +1328,7 @@ func serveShareDirectory(w http.ResponseWriter, r *http.Request, share ShareItem
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			invalidateListCache()
 		case "upload":
 			file, header, err := r.FormFile("file")
 			if err != nil {
@@ -1060,6 +1352,7 @@ func serveShareDirectory(w http.ResponseWriter, r *http.Request, share ShareItem
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
+			invalidateListCache()
 		default:
 			http.Error(w, "unsupported action", http.StatusBadRequest)
 			return
@@ -1068,32 +1361,11 @@ func serveShareDirectory(w http.ResponseWriter, r *http.Request, share ShareItem
 		return
 	}
 
-	entries, err := os.ReadDir(target)
+	items, err := buildFileItems(target, rel)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	items := make([]FileItem, 0, len(entries))
-	for _, entry := range entries {
-		entryInfo, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		items = append(items, FileItem{
-			Name:     entry.Name(),
-			IsDir:    entry.IsDir(),
-			Size:     entryInfo.Size(),
-			Path:     pathpkg.Join(rel, entry.Name()),
-			Modified: entryInfo.ModTime().Format("2006-01-02 15:04"),
-		})
-	}
-	sort.Slice(items, func(i, j int) bool {
-		if items[i].IsDir != items[j].IsDir {
-			return items[i].IsDir
-		}
-		return strings.ToLower(items[i].Name) < strings.ToLower(items[j].Name)
-	})
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(renderSharePage(r, share, rel, items)))
@@ -1240,6 +1512,7 @@ func apiMkdir(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	invalidateListCache()
 	writeJSON(w, map[string]bool{"ok": true})
 }
 
@@ -1249,23 +1522,18 @@ func apiUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	basePath := cleanVirtualPath(r.PostFormValue("path"))
-	targetDir, err := resolvePath(getCurrentRoot(), basePath)
-	if err != nil {
-		http.Error(w, "invalid path", http.StatusBadRequest)
-		return
-	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
+	if err := r.ParseMultipartForm(uploadMemoryLimit); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	defer file.Close()
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
+	}
 
-	filename := filepath.Base(header.Filename)
-	if filename == "." || filename == string(os.PathSeparator) || filename == "" {
-		http.Error(w, "invalid file name", http.StatusBadRequest)
+	basePath := cleanVirtualPath(r.FormValue("path"))
+	targetDir, err := resolvePath(getCurrentRoot(), basePath)
+	if err != nil {
+		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
 
@@ -1274,18 +1542,25 @@ func apiUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dst, err := os.Create(filepath.Join(targetDir, filename))
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	headers := collectUploadFiles(r.MultipartForm)
+	if len(headers) == 0 {
+		http.Error(w, "no files uploaded", http.StatusBadRequest)
 		return
 	}
-	defer dst.Close()
 
-	if _, err := io.Copy(dst, file); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	saved := 0
+	for _, header := range headers {
+		if err := saveUploadedFile(targetDir, header); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		saved++
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	invalidateListCache()
+	writeJSON(w, map[string]any{
+		"ok":    true,
+		"count": saved,
+	})
 }
 
 func apiDelete(w http.ResponseWriter, r *http.Request) {
@@ -1294,23 +1569,36 @@ func apiDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	virtualPath := cleanVirtualPath(r.PostFormValue("path"))
-	if virtualPath == "/" {
-		http.Error(w, "root cannot be deleted", http.StatusBadRequest)
-		return
-	}
-
-	full, err := resolvePath(getCurrentRoot(), virtualPath)
+	paths, err := readBatchPaths(r)
 	if err != nil {
-		http.Error(w, "invalid path", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if err := os.RemoveAll(full); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	deleted := 0
+	for _, virtualPath := range paths {
+		if virtualPath == "/" {
+			http.Error(w, "root cannot be deleted", http.StatusBadRequest)
+			return
+		}
+
+		full, err := resolvePath(getCurrentRoot(), virtualPath)
+		if err != nil {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+
+		if err := os.RemoveAll(full); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		deleted++
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	invalidateListCache()
+	writeJSON(w, map[string]any{
+		"ok":    true,
+		"count": deleted,
+	})
 }
 
 func apiDownload(w http.ResponseWriter, r *http.Request) {
@@ -1334,34 +1622,130 @@ func apiDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, full)
 }
 
-func apiZip(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
+func apiPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	virtualPath := cleanVirtualPath(r.PostFormValue("path"))
-	if virtualPath == "/" {
-		http.Error(w, "root cannot be zipped", http.StatusBadRequest)
-		return
-	}
-
+	virtualPath := cleanVirtualPath(r.URL.Query().Get("path"))
 	full, err := resolvePath(getCurrentRoot(), virtualPath)
 	if err != nil {
 		http.Error(w, "invalid path", http.StatusBadRequest)
 		return
 	}
 
-	if _, err := os.Stat(full); err != nil {
+	info, err := os.Stat(full)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
+	if info.IsDir() {
+		http.Error(w, "directory preview is not supported", http.StatusBadRequest)
+		return
+	}
 
-	if err := createZipArchive(full, full+".zip"); err != nil {
+	file, err := os.Open(full)
+	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]bool{"ok": true})
+	defer file.Close()
+
+	sample := make([]byte, 1024)
+	n, readErr := file.Read(sample)
+	if readErr != nil && readErr != io.EOF {
+		http.Error(w, readErr.Error(), http.StatusInternalServerError)
+		return
+	}
+	sample = sample[:n]
+
+	kind := previewKindForFile(info.Name(), sample)
+	contentType := mime.TypeByExtension(strings.ToLower(filepath.Ext(info.Name())))
+	if contentType == "" && len(sample) > 0 {
+		contentType = http.DetectContentType(sample)
+	}
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+
+	if kind != "text" {
+		writeJSON(w, map[string]any{
+			"kind":         kind,
+			"name":         info.Name(),
+			"size":         info.Size(),
+			"content_type": contentType,
+		})
+		return
+	}
+
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data, err := io.ReadAll(io.LimitReader(file, maxTextPreviewLen+1))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	truncated := len(data) > maxTextPreviewLen
+	if truncated {
+		data = data[:maxTextPreviewLen]
+	}
+
+	writeJSON(w, map[string]any{
+		"kind":         "text",
+		"name":         info.Name(),
+		"size":         info.Size(),
+		"text":         string(data),
+		"truncated":    truncated,
+		"content_type": contentType,
+	})
+}
+
+func apiZip(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	paths, err := readBatchPaths(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	zipped := 0
+	for _, virtualPath := range paths {
+		if virtualPath == "/" {
+			http.Error(w, "root cannot be zipped", http.StatusBadRequest)
+			return
+		}
+
+		full, err := resolvePath(getCurrentRoot(), virtualPath)
+		if err != nil {
+			http.Error(w, "invalid path", http.StatusBadRequest)
+			return
+		}
+
+		if _, err := os.Stat(full); err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+
+		if err := createZipArchive(full, full+".zip"); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		zipped++
+	}
+	invalidateListCache()
+	writeJSON(w, map[string]any{
+		"ok":    true,
+		"count": zipped,
+	})
 }
 
 func createZipArchive(sourcePath, zipPath string) error {
@@ -1410,11 +1794,87 @@ func createZipArchive(sourcePath, zipPath string) error {
 		if err != nil {
 			return err
 		}
-		defer file.Close()
 
-		_, err = io.Copy(w, file)
-		return err
+		_, copyErr := io.Copy(w, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
 	})
+}
+
+func unzipArchive(full string) error {
+	if !strings.EqualFold(filepath.Ext(full), ".zip") {
+		return errors.New("please select a zip file")
+	}
+
+	rc, err := zip.OpenReader(full)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	zipExt := filepath.Ext(full)
+	destDir := full[:len(full)-len(zipExt)]
+	destAbs, err := filepath.Abs(destDir)
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(destAbs, 0755); err != nil {
+		return err
+	}
+
+	for _, file := range rc.File {
+		targetPath := filepath.Join(destAbs, filepath.FromSlash(file.Name))
+		targetAbs, err := filepath.Abs(targetPath)
+		if err != nil {
+			return err
+		}
+
+		relCheck, err := filepath.Rel(destAbs, targetAbs)
+		if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(os.PathSeparator)) {
+			return errors.New("zip contains invalid path")
+		}
+
+		if file.FileInfo().IsDir() {
+			if err := os.MkdirAll(targetAbs, 0755); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if err := os.MkdirAll(filepath.Dir(targetAbs), 0755); err != nil {
+			return err
+		}
+
+		src, err := file.Open()
+		if err != nil {
+			return err
+		}
+
+		dst, err := os.OpenFile(targetAbs, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
+		if err != nil {
+			src.Close()
+			return err
+		}
+
+		_, copyErr := io.Copy(dst, src)
+		closeErr := dst.Close()
+		srcErr := src.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if srcErr != nil {
+			return srcErr
+		}
+	}
+
+	return nil
 }
 
 func apiUnzip(w http.ResponseWriter, r *http.Request) {
@@ -1423,95 +1883,31 @@ func apiUnzip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	virtualPath := cleanVirtualPath(r.PostFormValue("path"))
-	full, err := resolvePath(getCurrentRoot(), virtualPath)
+	paths, err := readBatchPaths(r)
 	if err != nil {
-		http.Error(w, "invalid path", http.StatusBadRequest)
-		return
-	}
-	if !strings.EqualFold(filepath.Ext(full), ".zip") {
-		http.Error(w, "please select a zip file", http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	rc, err := zip.OpenReader(full)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer rc.Close()
-
-	zipExt := filepath.Ext(full)
-	destDir := full[:len(full)-len(zipExt)]
-	destAbs, err := filepath.Abs(destDir)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	if err := os.MkdirAll(destAbs, 0755); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	for _, file := range rc.File {
-		targetPath := filepath.Join(destAbs, filepath.FromSlash(file.Name))
-		targetAbs, err := filepath.Abs(targetPath)
+	unzipped := 0
+	for _, virtualPath := range paths {
+		full, err := resolvePath(getCurrentRoot(), virtualPath)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
-
-		relCheck, err := filepath.Rel(destAbs, targetAbs)
-		if err != nil || relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(os.PathSeparator)) {
-			http.Error(w, "zip contains invalid path", http.StatusBadRequest)
+		if err := unzipArchive(full); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-
-		if file.FileInfo().IsDir() {
-			if err := os.MkdirAll(targetAbs, 0755); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			continue
-		}
-
-		if err := os.MkdirAll(filepath.Dir(targetAbs), 0755); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		src, err := file.Open()
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		dst, err := os.OpenFile(targetAbs, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, file.Mode())
-		if err != nil {
-			src.Close()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		_, copyErr := io.Copy(dst, src)
-		closeErr := dst.Close()
-		srcErr := src.Close()
-		if copyErr != nil {
-			http.Error(w, copyErr.Error(), http.StatusInternalServerError)
-			return
-		}
-		if closeErr != nil {
-			http.Error(w, closeErr.Error(), http.StatusInternalServerError)
-			return
-		}
-		if srcErr != nil {
-			http.Error(w, srcErr.Error(), http.StatusInternalServerError)
-			return
-		}
+		unzipped++
 	}
 
-	writeJSON(w, map[string]bool{"ok": true})
+	invalidateListCache()
+	writeJSON(w, map[string]any{
+		"ok":    true,
+		"count": unzipped,
+	})
 }
 
 func apiAccount(w http.ResponseWriter, r *http.Request) {
@@ -1768,6 +2164,12 @@ const pageHTML = `<!DOCTYPE html>
             gap:10px;
             flex-wrap:wrap;
         }
+        .toolbar-actions{
+            display:flex;
+            gap:10px;
+            flex-wrap:wrap;
+            align-items:center;
+        }
         .summary{
             display:flex;
             align-items:center;
@@ -1879,8 +2281,17 @@ const pageHTML = `<!DOCTYPE html>
         .table-row{
             border-bottom:1px solid #edf1f7;
         }
+        .table-row.selected{
+            background:#f8fbff;
+        }
         .table-row:last-child{
             border-bottom:none;
+        }
+        .table-head input[type="checkbox"],
+        .table-row input[type="checkbox"],
+        .card-top input[type="checkbox"]{
+            width:16px;
+            height:16px;
         }
         .name-cell{
             display:flex;
@@ -1934,6 +2345,10 @@ const pageHTML = `<!DOCTYPE html>
             flex-direction:column;
             gap:12px;
             min-height:190px;
+        }
+        .file-card.selected{
+            border-color:#93c5fd;
+            background:#f8fbff;
         }
         .card-top{
             display:flex;
@@ -2026,6 +2441,29 @@ const pageHTML = `<!DOCTYPE html>
             max-width:100%;
             max-height:76vh;
         }
+        .preview-frame{
+            width:100%;
+            height:76vh;
+            border:none;
+            border-radius:6px;
+            background:#ffffff;
+        }
+        .preview-text{
+            width:100%;
+            margin:0;
+            padding:18px;
+            color:#e5e7eb;
+            font-family:Consolas,"SFMono-Regular",monospace;
+            font-size:13px;
+            line-height:1.6;
+            white-space:pre-wrap;
+            word-break:break-word;
+        }
+        .preview-note{
+            padding:14px 18px 0;
+            color:#fbbf24;
+            font-size:13px;
+        }
         #uploadInput{
             display:none;
         }
@@ -2042,6 +2480,10 @@ const pageHTML = `<!DOCTYPE html>
                 padding:16px 14px 24px;
             }
             .topbar{
+                flex-direction:column;
+                align-items:stretch;
+            }
+            .toolbar-actions{
                 flex-direction:column;
                 align-items:stretch;
             }
@@ -2102,15 +2544,22 @@ const pageHTML = `<!DOCTYPE html>
         </div>
 
         <div class="toolbar-row">
-            <div class="button-group">
-                <button class="secondary" onclick="goBack()">返回上级</button>
-                <button onclick="createFolder()">新建文件夹</button>
-                <button onclick="triggerUpload()">上传文件</button>
-                <button class="accent" onclick="zipSelected()">压缩</button>
-                <button class="accent" onclick="unzipSelected()">解压</button>
-                <button class="danger" onclick="deleteSelected()">删除</button>
+            <div class="toolbar-actions">
+                <div class="button-group">
+                    <button class="secondary" onclick="goBack()">返回上级</button>
+                    <button onclick="createFolder()">新建文件夹</button>
+                    <button onclick="triggerUpload()">上传文件</button>
+                    <button class="accent" onclick="zipSelected()">压缩</button>
+                    <button class="accent" onclick="unzipSelected()">解压</button>
+                    <button class="danger" onclick="deleteSelected()">删除</button>
+                </div>
+                <div class="button-group">
+                    <button class="secondary" type="button" onclick="selectAllCurrent()">全选</button>
+                    <button class="secondary" type="button" onclick="invertSelection()">反选</button>
+                    <button class="secondary" type="button" onclick="clearSelection()">清空选择</button>
+                </div>
             </div>
-            <div class="summary" id="selectionSummary">未选中项目</div>
+            <div class="summary" id="selectionSummary">当前目录暂无项目</div>
         </div>
 
         <input id="uploadInput" type="file" multiple>
@@ -2169,9 +2618,15 @@ let authHeader = "";
 let viewMode = localStorage.getItem("gowebdav-view") || "list";
 let fileItems = [];
 let selected = new Set();
-let previewObjectUrl = "";
 let shareItems = [];
 let selectedShares = new Set();
+let currentListController = null;
+let currentListToken = 0;
+
+const IMAGE_EXTS = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"]);
+const VIDEO_EXTS = new Set(["mp4", "webm", "ogg", "mov", "m4v"]);
+const AUDIO_EXTS = new Set(["mp3", "wav", "ogg", "m4a", "flac", "aac", "oga"]);
+const TEXT_EXTS = new Set(["txt", "md", "markdown", "json", "yaml", "yml", "toml", "ini", "conf", "log", "csv", "xml", "html", "htm", "css", "js", "jsx", "ts", "tsx", "vue", "go", "py", "java", "rb", "rs", "php", "c", "cc", "cpp", "h", "hpp", "cs", "sh", "bash", "ps1", "sql"]);
 
 function byId(id) {
     return document.getElementById(id);
@@ -2212,11 +2667,6 @@ async function apiJSON(url, options) {
     return response.json();
 }
 
-async function apiText(url, options) {
-    const response = await apiFetch(url, options);
-    return response.text();
-}
-
 function formBody(data) {
     const params = new URLSearchParams();
     Object.keys(data).forEach(function(key) {
@@ -2244,16 +2694,23 @@ function extOf(name) {
     return idx >= 0 ? name.slice(idx + 1).toLowerCase() : "";
 }
 
-function isImage(name) {
-    return ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg"].includes(extOf(name));
+function previewKind(item) {
+    const name = typeof item === "string" ? item : item && item.name ? item.name : "";
+    const ext = extOf(name);
+    if (IMAGE_EXTS.has(ext)) return "image";
+    if (VIDEO_EXTS.has(ext)) return "video";
+    if (AUDIO_EXTS.has(ext)) return "audio";
+    if (ext === "pdf") return "pdf";
+    if (TEXT_EXTS.has(ext)) return "text";
+    return "";
 }
 
-function isVideo(name) {
-    return ["mp4", "webm", "ogg", "mov", "m4v"].includes(extOf(name));
+function canPreview(item) {
+    return !!item && !item.is_dir && previewKind(item) !== "";
 }
 
-function isAudio(name) {
-    return ["mp3", "wav", "ogg", "m4a", "flac"].includes(extOf(name));
+function downloadURL(path) {
+    return "/api/download?path=" + encodeURIComponent(path);
 }
 
 function kindText(item) {
@@ -2264,9 +2721,54 @@ function kindText(item) {
     return ext ? ext.toUpperCase() : "文件";
 }
 
+function selectedVisibleCount() {
+    let count = 0;
+    fileItems.forEach(function(item) {
+        if (selected.has(item.path)) {
+            count += 1;
+        }
+    });
+    return count;
+}
+
+function selectedVisibleSize() {
+    let total = 0;
+    fileItems.forEach(function(item) {
+        if (!item.is_dir && selected.has(item.path)) {
+            total += Number(item.size || 0);
+        }
+    });
+    return total;
+}
+
+function updateSelectAllState(selectedCount, totalCount) {
+    document.querySelectorAll(".select-all-toggle").forEach(function(checkbox) {
+        checkbox.disabled = totalCount === 0;
+        checkbox.checked = totalCount > 0 && selectedCount === totalCount;
+        checkbox.indeterminate = selectedCount > 0 && selectedCount < totalCount;
+    });
+}
+
 function updateSelectionSummary() {
-    const count = selected.size;
-    byId("selectionSummary").textContent = count === 0 ? "未选中项目" : "已选中 " + count + " 项";
+    const summary = byId("selectionSummary");
+    if (!summary) {
+        return;
+    }
+
+    const totalCount = fileItems.length;
+    const selectedCount = selectedVisibleCount();
+    let text = totalCount === 0 ? "当前目录暂无项目" : "共 " + totalCount + " 项";
+    if (selectedCount > 0) {
+        text += "，已选中 " + selectedCount + " 项";
+        const selectedSize = selectedVisibleSize();
+        if (selectedSize > 0) {
+            text += "（" + formatSize(selectedSize) + "）";
+        }
+    } else if (totalCount > 0) {
+        text += "，未选中项目";
+    }
+    summary.textContent = text;
+    updateSelectAllState(selectedCount, totalCount);
 }
 
 function syncDiskSelection() {
@@ -2340,6 +2842,37 @@ function toggleSelection(path, checked) {
     updateSelectionSummary();
 }
 
+function selectAllCurrent() {
+    selected = new Set(fileItems.map(function(item) {
+        return item.path;
+    }));
+    renderFiles();
+}
+
+function invertSelection() {
+    const next = new Set();
+    fileItems.forEach(function(item) {
+        if (!selected.has(item.path)) {
+            next.add(item.path);
+        }
+    });
+    selected = next;
+    renderFiles();
+}
+
+function clearSelection() {
+    selected = new Set();
+    renderFiles();
+}
+
+function toggleSelectAll(checked) {
+    if (checked) {
+        selectAllCurrent();
+        return;
+    }
+    clearSelection();
+}
+
 function openPath(path) {
     currentPath = path || "/";
     selected = new Set();
@@ -2352,7 +2885,7 @@ function openItem(item) {
         openPath(item.path);
         return;
     }
-    if (isImage(item.name) || isVideo(item.name) || isAudio(item.name)) {
+    if (canPreview(item)) {
         previewItem(item);
         return;
     }
@@ -2364,7 +2897,7 @@ function createItemActions(item) {
     box.className = "actions";
 
     if (!item.is_dir) {
-        if (isImage(item.name) || isVideo(item.name) || isAudio(item.name)) {
+        if (canPreview(item)) {
             box.appendChild(makeActionButton("预览", "secondary", function() {
                 previewItem(item);
             }));
@@ -2383,12 +2916,39 @@ function renderListView(container) {
 
     const head = document.createElement("div");
     head.className = "table-head";
-    head.innerHTML = "<div></div><div>名称</div><div class='size-col'>大小</div><div class='modified-col'>修改时间</div><div>操作</div>";
+    const headSelect = document.createElement("div");
+    const selectAll = document.createElement("input");
+    selectAll.type = "checkbox";
+    selectAll.className = "select-all-toggle";
+    selectAll.setAttribute("aria-label", "全选当前目录");
+    selectAll.onchange = function(event) {
+        toggleSelectAll(event.target.checked);
+    };
+    headSelect.appendChild(selectAll);
+    head.appendChild(headSelect);
+
+    const nameHead = document.createElement("div");
+    nameHead.textContent = "名称";
+    head.appendChild(nameHead);
+
+    const sizeHead = document.createElement("div");
+    sizeHead.className = "size-col";
+    sizeHead.textContent = "大小";
+    head.appendChild(sizeHead);
+
+    const modifiedHead = document.createElement("div");
+    modifiedHead.className = "modified-col";
+    modifiedHead.textContent = "修改时间";
+    head.appendChild(modifiedHead);
+
+    const actionHead = document.createElement("div");
+    actionHead.textContent = "操作";
+    head.appendChild(actionHead);
     table.appendChild(head);
 
     fileItems.forEach(function(item) {
         const row = document.createElement("div");
-        row.className = "table-row";
+        row.className = "table-row" + (selected.has(item.path) ? " selected" : "");
 
         const checkboxWrap = document.createElement("div");
         const checkbox = document.createElement("input");
@@ -2440,7 +3000,7 @@ function renderCardView(container) {
 
     fileItems.forEach(function(item) {
         const card = document.createElement("div");
-        card.className = "file-card";
+        card.className = "file-card" + (selected.has(item.path) ? " selected" : "");
 
         const top = document.createElement("div");
         top.className = "card-top";
@@ -2519,6 +3079,7 @@ function renderFiles() {
         empty.className = "empty";
         empty.textContent = "当前目录没有文件。";
         container.appendChild(empty);
+        updateSelectionSummary();
         return;
     }
 
@@ -2527,6 +3088,7 @@ function renderFiles() {
     } else {
         renderListView(container);
     }
+    updateSelectionSummary();
 }
 
 async function loadDisks() {
@@ -2560,19 +3122,41 @@ async function loadAccount() {
 }
 
 async function loadFiles() {
+    const requestToken = ++currentListToken;
+    if (currentListController) {
+        currentListController.abort();
+    }
+    const controller = new AbortController();
+    currentListController = controller;
+
     try {
         setStatus("正在加载文件...", "loading");
         renderPathBar();
-        const data = await apiJSON("/api/list?path=" + encodeURIComponent(currentPath));
+        const data = await apiJSON("/api/list?path=" + encodeURIComponent(currentPath), {
+            signal: controller.signal
+        });
+        if (requestToken !== currentListToken) {
+            return;
+        }
         currentPath = data.path || "/";
         fileItems = Array.isArray(data.items) ? data.items : [];
         renderPathBar();
         renderFiles();
         setStatus("已加载 " + fileItems.length + " 项", "success");
     } catch (error) {
+        if (error && error.name === "AbortError") {
+            return;
+        }
+        if (requestToken !== currentListToken) {
+            return;
+        }
         fileItems = [];
         renderFiles();
         setStatus(error.message, "error");
+    } finally {
+        if (currentListController === controller) {
+            currentListController = null;
+        }
     }
 }
 
@@ -2642,15 +3226,15 @@ async function handleUpload(event) {
 
     try {
         setStatus("正在上传 " + files.length + " 个文件...", "loading");
-        for (const file of files) {
-            const form = new FormData();
-            form.append("path", currentPath);
-            form.append("file", file);
-            await apiJSON("/api/upload", {
-                method: "POST",
-                body: form
-            });
-        }
+        const form = new FormData();
+        form.append("path", currentPath);
+        files.forEach(function(file) {
+            form.append("files", file, file.name);
+        });
+        await apiJSON("/api/upload", {
+            method: "POST",
+            body: form
+        });
         event.target.value = "";
         await loadFiles();
         setStatus("上传完成", "success");
@@ -2676,13 +3260,11 @@ async function runSelectionAction(endpoint, options) {
 
     try {
         setStatus(options.loadingMessage, "loading");
-        for (const path of paths) {
-            await apiJSON(endpoint, {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: formBody({ path: path })
-            });
-        }
+        await apiJSON(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paths: paths })
+        });
         selected = new Set();
         updateSelectionSummary();
         await loadFiles();
@@ -2722,7 +3304,7 @@ function unzipSelected() {
 async function downloadItem(item) {
     try {
         setStatus("正在下载 " + item.name + "...", "loading");
-        const response = await apiFetch("/api/download?path=" + encodeURIComponent(item.path));
+        const response = await apiFetch(downloadURL(item.path));
         const blob = await response.blob();
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
@@ -2740,41 +3322,57 @@ async function downloadItem(item) {
     }
 }
 
-function revokePreviewUrl() {
-    if (previewObjectUrl) {
-        URL.revokeObjectURL(previewObjectUrl);
-        previewObjectUrl = "";
-    }
-}
-
 async function previewItem(item) {
+    const kind = previewKind(item);
+    if (!kind) {
+        setStatus("当前文件不支持在线预览。", "error");
+        return;
+    }
+
     try {
         setStatus("正在加载预览...", "loading");
-        revokePreviewUrl();
-        const response = await apiFetch("/api/download?path=" + encodeURIComponent(item.path));
-        const blob = await response.blob();
-        previewObjectUrl = URL.createObjectURL(blob);
         byId("previewTitle").textContent = item.name;
         const body = byId("previewBody");
         body.innerHTML = "";
 
-        if (isImage(item.name)) {
+        if (kind === "image") {
             const img = document.createElement("img");
-            img.src = previewObjectUrl;
+            img.src = downloadURL(item.path);
             img.alt = item.name;
             body.appendChild(img);
-        } else if (isVideo(item.name)) {
+        } else if (kind === "video") {
             const video = document.createElement("video");
-            video.src = previewObjectUrl;
+            video.src = downloadURL(item.path);
             video.controls = true;
             video.autoplay = true;
             body.appendChild(video);
-        } else if (isAudio(item.name)) {
+        } else if (kind === "audio") {
             const audio = document.createElement("audio");
-            audio.src = previewObjectUrl;
+            audio.src = downloadURL(item.path);
             audio.controls = true;
             audio.autoplay = true;
             body.appendChild(audio);
+        } else if (kind === "pdf") {
+            const frame = document.createElement("iframe");
+            frame.className = "preview-frame";
+            frame.src = downloadURL(item.path);
+            frame.title = item.name;
+            body.appendChild(frame);
+        } else if (kind === "text") {
+            const data = await apiJSON("/api/preview?path=" + encodeURIComponent(item.path));
+            const wrapper = document.createElement("div");
+            wrapper.style.width = "100%";
+            if (data.truncated) {
+                const note = document.createElement("div");
+                note.className = "preview-note";
+                note.textContent = "为保证性能，仅显示前 256 KB 内容。";
+                wrapper.appendChild(note);
+            }
+            const pre = document.createElement("pre");
+            pre.className = "preview-text";
+            pre.textContent = data.text || "";
+            wrapper.appendChild(pre);
+            body.appendChild(wrapper);
         } else {
             body.textContent = "当前文件不支持在线预览。";
         }
@@ -2789,7 +3387,6 @@ async function previewItem(item) {
 function closePreview() {
     byId("previewModal").classList.remove("open");
     byId("previewBody").innerHTML = "";
-    revokePreviewUrl();
 }
 
 function openAccountModal() {
@@ -2855,10 +3452,6 @@ function permissionText(permission) {
     if (permission === "view") return "可预览";
     if (permission === "edit") return "可编辑";
     return permission || "-";
-}
-
-function selectedPaths() {
-    return Array.from(selected);
 }
 
 function selectedShareTokens() {
@@ -3010,6 +3603,11 @@ async function loadShares() {
     try {
         const data = await apiJSON("/api/shares");
         shareItems = Array.isArray(data.items) ? data.items : [];
+        selectedShares = new Set(shareItems.filter(function(item) {
+            return selectedShares.has(item.token);
+        }).map(function(item) {
+            return item.token;
+        }));
         renderShares();
     } catch (error) {
         setStatus(error.message, "error");
@@ -3142,10 +3740,18 @@ async function copyShareLink(link) {
     }
 }
 
+function handleGlobalKeydown(event) {
+    if (event.key === "Escape" && byId("previewModal").classList.contains("open")) {
+        closePreview();
+    }
+}
+
 async function init() {
     ensureShareUI();
     byId("uploadInput").addEventListener("change", handleUpload);
+    document.addEventListener("keydown", handleGlobalKeydown);
     setViewMode(viewMode);
+    renderPathBar();
     updateSelectionSummary();
     try {
         await loadDisks();
